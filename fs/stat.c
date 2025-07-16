@@ -19,7 +19,7 @@
 #include <linux/pagemap.h>
 #include <linux/compat.h>
 
-#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MOUNT)
+#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_SU)
 #include <linux/susfs_def.h>
 #endif
 #include <linux/uaccess.h>
@@ -52,7 +52,7 @@ void generic_fillattr(struct user_namespace *mnt_userns, struct inode *inode,
 		      struct kstat *stat)
 {
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-	if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+	if (likely(susfs_is_current_non_root_user_app_proc()) &&
 			unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
 		susfs_sus_ino_for_generic_fillattr(inode->i_ino, stat);
 		stat->mode = inode->i_mode;
@@ -255,7 +255,7 @@ retry:
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 	mnt = real_mount(path.mnt);
-	if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)) {
+	if (likely(susfs_is_current_non_root_user_app_proc())) {
 		for (; mnt->mnt_id >= DEFAULT_SUS_MNT_ID; mnt = mnt->mnt_parent) {}
 	}
 	stat->mnt_id = mnt->mnt_id;
@@ -287,6 +287,7 @@ out:
 
 #ifdef CONFIG_KSU_SUSFS_SUS_SU
 extern bool susfs_is_sus_su_hooks_enabled __read_mostly;
+extern bool __ksu_is_allow_uid(uid_t uid);
 extern struct filename* susfs_ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
 #endif
 
@@ -298,15 +299,21 @@ int vfs_fstatat(int dfd, const char __user *filename,
 	struct filename *name;
 
 #ifdef CONFIG_KSU_SUSFS_SUS_SU
-	if (likely(susfs_is_sus_su_hooks_enabled)) {
-		name = susfs_ksu_handle_stat(&dfd, &filename, &statx_flags);
-		goto orig_flow;
+	if (likely(susfs_is_current_proc_su_not_allowed())) {
+		goto orig_flow1;
 	}
+	if (likely(susfs_is_sus_su_hooks_enabled) &&
+		unlikely(__ksu_is_allow_uid(current_uid().val)))
+	{
+		name = susfs_ksu_handle_stat(&dfd, &filename, &statx_flags);
+		goto orig_flow2;
+	}
+orig_flow1:
 #endif
 
 	name = getname_flags(filename, getname_statx_lookup_flags(statx_flags), NULL);
 #ifdef CONFIG_KSU_SUSFS_SUS_SU
-orig_flow:
+orig_flow2:
 #endif
 	ret = vfs_statx(dfd, name, statx_flags, stat, STATX_BASIC_STATS);
 	putname(name);
