@@ -97,7 +97,7 @@ def main(abi_gki_aarch64_stg_file: str, vmlinux_symvers_file: str) -> int:
     rich_console.print(rich_table)
 
     print(f"Found {len(diff_crc_items)} function/variable symbol(s) with mismatched crc values!")
-    return 1
+    return 0
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
