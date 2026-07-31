@@ -434,28 +434,36 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	 * We should do GC or end up with checkpoint, if there are so many dirty
 	 * dir/node pages without enough free segments.
 	 */
-	if (has_enough_free_secs(sbi, 0, 0))
-		return;
+	if (has_not_enough_free_secs(sbi, 0, 0)) {
+		/*
+		 * Submit all cached OPU/IPU DATA bios before triggering
+		 * foreground GC to avoid potential deadlocks.
+		 */
+		f2fs_submit_merged_write(sbi, DATA);
+		f2fs_submit_all_merged_ipu_writes(sbi);
 
-	if (test_opt(sbi, GC_MERGE) && sbi->gc_thread &&
-				sbi->gc_thread->f2fs_gc_task) {
-		DEFINE_WAIT(wait);
+		if (test_opt(sbi, GC_MERGE) && sbi->gc_thread &&
+					sbi->gc_thread->f2fs_gc_task) {
+			DEFINE_WAIT(wait);
 
-		prepare_to_wait(&sbi->gc_thread->fggc_wq, &wait,
-					TASK_UNINTERRUPTIBLE);
-		wake_up(&sbi->gc_thread->gc_wait_queue_head);
-		io_schedule();
-		finish_wait(&sbi->gc_thread->fggc_wq, &wait);
-	} else {
-		struct f2fs_gc_control gc_control = {
-			.victim_segno = NULL_SEGNO,
-			.init_gc_type = BG_GC,
-			.no_bg_gc = true,
-			.should_migrate_blocks = false,
-			.err_gc_skipped = false,
-			.nr_free_secs = 1 };
-		f2fs_down_write_trace(&sbi->gc_lock, &gc_control.lc);
-		f2fs_gc(sbi, &gc_control);
+			prepare_to_wait(&sbi->gc_thread->fggc_wq, &wait,
+						TASK_UNINTERRUPTIBLE);
+			wake_up(&sbi->gc_thread->gc_wait_queue_head);
+			io_schedule();
+			finish_wait(&sbi->gc_thread->fggc_wq, &wait);
+		} else {
+			struct f2fs_gc_control gc_control = {
+				.victim_segno = NULL_SEGNO,
+				.init_gc_type = BG_GC,
+				.no_bg_gc = true,
+				.should_migrate_blocks = false,
+				.err_gc_skipped = false,
+				.nr_free_secs = 1 };
+
+			f2fs_down_write_trace(&sbi->gc_lock, &gc_control.lc);
+			f2fs_gc(sbi, &gc_control);
+		}
+	}
 	}
 }
 

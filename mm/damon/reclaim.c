@@ -191,6 +191,7 @@ static bool damon_reclaim_enabled(void)
 }
 
 
+
 static int damon_reclaim_enabled_store(const char *val,
 		const struct kernel_param *kp)
 {
