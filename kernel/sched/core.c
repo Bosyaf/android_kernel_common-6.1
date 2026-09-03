@@ -4536,22 +4536,43 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 EXPORT_SYMBOL(wake_up_state);
 
 #ifdef CONFIG_SCHED_BORE
-extern u8 sched_burst_fork_atavistic;
+extern u8 sched_burst_inherit_type;
 extern unsigned int sched_burst_cache_lifetime;
+
+#define BORE_BC_TS_BITS   48
+#define BORE_BC_TS_MASK   ((1ULL << BORE_BC_TS_BITS) - 1)
+#define BORE_BC_PACK(ts, pen)   ((((u64)(pen)) << BORE_BC_TS_BITS) | ((ts) & BORE_BC_TS_MASK))
+#define BORE_BC_TIMESTAMP(bc)   ((bc) & BORE_BC_TS_MASK)
+#define BORE_BC_PENALTY(bc)     ((u16)((bc) >> BORE_BC_TS_BITS))
+
+#define BURST_CACHE_SAMPLE_LIMIT 63
+#define BURST_CACHE_SCAN_LIMIT   (BURST_CACHE_SAMPLE_LIMIT * 2)
+
+static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
 
 static void __init sched_init_bore(void)
 {
+	int i;
+
+	for (i = 1; i <= BURST_CACHE_SAMPLE_LIMIT; i++)
+		bore_reciprocal_lut[i] = (u32)div64_u64(0xffffffffULL + i, i);
+
 	init_task.se.burst_time = 0;
 	init_task.se.prev_burst_penalty = 0;
 	init_task.se.curr_burst_penalty = 0;
 	init_task.se.burst_penalty = 0;
-	init_task.se.burst_score = 0;
-	init_task.se.child_burst = 0;
-	init_task.se.child_burst_cnt = 0;
-	init_task.se.child_burst_last_cached = 0;
+	init_task.se.stop_update = false;
+	init_task.se.futex_waiting = false;
+	init_task.se.child_burst_cache = 0;
+	init_task.se.group_burst_cache = 0;
 }
 
-static u32 count_child_tasks(struct task_struct *p)
+static inline bool task_burst_inheritable(struct task_struct *p)
+{
+	return p && p->sched_class == &fair_sched_class && !p->exit_state;
+}
+
+static u32 __maybe_unused count_child_tasks(struct task_struct *p)
 {
 	struct task_struct *child;
 	u32 cnt = 0;
@@ -4562,130 +4583,154 @@ static u32 count_child_tasks(struct task_struct *p)
 	return cnt;
 }
 
-static inline bool task_burst_inheritable(struct task_struct *p)
+static inline bool burst_cache_expired(u64 bc, u64 now)
 {
-	return p->sched_class == &fair_sched_class;
+	return now - (BORE_BC_TIMESTAMP(bc) << 16) > (u64)sched_burst_cache_lifetime;
 }
 
-static inline bool child_burst_cache_expired(struct task_struct *p, u64 now)
+static u16 average_burst(u32 count, u32 total)
 {
-	u64 expiration_time = p->se.child_burst_last_cached +
-			      sched_burst_cache_lifetime;
-
-	return (s64)(expiration_time - now) < 0;
+	if (!count)
+		return 0;
+	if (count == 1)
+		return (u16)total;
+	if (count <= BURST_CACHE_SAMPLE_LIMIT)
+		return (u16)(((u64)total * bore_reciprocal_lut[count]) >> 32);
+	return (u16)(total / count);
 }
 
-static void __update_child_burst_cache(struct task_struct *p, u32 cnt,
-				       u32 sum, u64 now)
+static void update_burst_cache(u64 *bc, struct task_struct *ref,
+				u32 count, u32 total, u64 now)
 {
-	u8 avg = 0;
+	u16 average = average_burst(count, total);
+	u16 penalty = max_t(u16, average, ref->se.burst_penalty);
 
-	if (cnt)
-		avg = sum / cnt;
-
-	p->se.child_burst = max_t(u8, avg, p->se.burst_penalty);
-	p->se.child_burst_cnt = cnt;
-	p->se.child_burst_last_cached = now;
+	WRITE_ONCE(*bc, BORE_BC_PACK(now >> 16, penalty));
 }
 
-static void update_child_burst_direct(struct task_struct *p, u64 now)
+static u16 inherit_from_direct_children(struct task_struct *parent, u64 now)
 {
 	struct task_struct *child;
-	u32 cnt = 0, sum = 0;
+	u32 count = 0, total = 0, scan = 0;
 
-	list_for_each_entry(child, &p->children, sibling) {
-		if (!task_burst_inheritable(child))
-			continue;
-		cnt++;
-		sum += child->se.burst_penalty;
+	if (burst_cache_expired(parent->se.child_burst_cache, now)) {
+		list_for_each_entry(child, &parent->children, sibling) {
+			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+			if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+			if (!task_burst_inheritable(child)) continue;
+			count++;
+			total += child->se.burst_penalty;
+		}
+		update_burst_cache(&parent->se.child_burst_cache, parent, count, total, now);
 	}
 
-	__update_child_burst_cache(p, cnt, sum, now);
+	return BORE_BC_PENALTY(READ_ONCE(parent->se.child_burst_cache));
 }
 
-static inline u8 inherit_burst_direct(struct task_struct *p, u64 now)
+static inline u32 count_children_upto2(struct task_struct *p)
 {
-	if (child_burst_cache_expired(p, now))
-		update_child_burst_direct(p, now);
+	struct list_head *head = &p->children;
+	struct list_head *first = READ_ONCE(head->next);
+	struct list_head *second = READ_ONCE(first->next);
 
-	return p->se.child_burst;
+	return (first != head) + (second != head);
 }
 
 static void update_child_burst_topological(struct task_struct *p, u64 now,
-					   u32 depth, u32 *acnt, u32 *asum)
+					    u32 depth, u32 *acnt, u32 *asum)
 {
 	struct task_struct *child, *dec;
-	u32 cnt = 0, dcnt = 0, sum = 0;
+	u32 count = 0, sum = 0, scan = 0;
 
 	list_for_each_entry(child, &p->children, sibling) {
 		dec = child;
-		while ((dcnt = count_child_tasks(dec)) == 1)
-			dec = list_first_entry(&dec->children,
-					       struct task_struct, sibling);
+		while (count_children_upto2(dec) == 1)
+			dec = list_first_entry(&dec->children, struct task_struct, sibling);
 
-		if (!dcnt || !depth) {
-			if (!task_burst_inheritable(dec))
-				continue;
-			cnt++;
+		if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+		if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+
+		if (!depth || count_children_upto2(dec) == 0) {
+			if (!task_burst_inheritable(dec)) continue;
+			count++;
 			sum += dec->se.burst_penalty;
 			continue;
 		}
 
-		if (!child_burst_cache_expired(dec, now)) {
-			cnt += dec->se.child_burst_cnt;
-			sum += (u32)dec->se.child_burst * dec->se.child_burst_cnt;
+		if (!burst_cache_expired(dec->se.child_burst_cache, now)) {
+			count++;
+			sum += BORE_BC_PENALTY(dec->se.child_burst_cache);
 			continue;
 		}
 
-		update_child_burst_topological(dec, now, depth - 1, &cnt, &sum);
+		update_child_burst_topological(dec, now, depth - 1, &count, &sum);
 	}
 
-	__update_child_burst_cache(p, cnt, sum, now);
-	*acnt += cnt;
+	update_burst_cache(&p->se.child_burst_cache, p, count, sum, now);
+	*acnt += count;
 	*asum += sum;
 }
 
-static inline u8 inherit_burst_topological(struct task_struct *p, u64 now)
+static u16 inherit_from_ancestor_hub(struct task_struct *parent, u64 now)
 {
-	struct task_struct *anc = p;
-	u32 cnt = 0, sum = 0;
+	struct task_struct *anc = parent;
+	u32 count = 0, sum = 0;
 
-	while (anc->real_parent != anc && count_child_tasks(anc) == 1)
+	while (anc->real_parent != anc && count_children_upto2(anc) == 1)
 		anc = anc->real_parent;
 
-	if (child_burst_cache_expired(anc, now))
-		update_child_burst_topological(anc, now,
-					       sched_burst_fork_atavistic - 1,
-					       &cnt, &sum);
+	if (burst_cache_expired(anc->se.child_burst_cache, now))
+		update_child_burst_topological(anc, now, 3, &count, &sum);
 
-	return anc->se.child_burst;
+	return BORE_BC_PENALTY(READ_ONCE(anc->se.child_burst_cache));
 }
 
-static void inherit_burst(struct task_struct *p, struct task_struct *parent)
+static u16 inherit_from_thread_group(struct task_struct *p, u64 now)
 {
-	u8 burst_cache;
-	u64 now = ktime_get_ns();
+	struct task_struct *leader = p->group_leader;
+	struct task_struct *sibling;
+	u32 count = 0, total = 0, scan = 0;
 
-	read_lock(&tasklist_lock);
-	burst_cache = likely(sched_burst_fork_atavistic) ?
-		inherit_burst_topological(parent, now) :
-		inherit_burst_direct(parent, now);
-	read_unlock(&tasklist_lock);
+	if (burst_cache_expired(leader->se.group_burst_cache, now)) {
+		for_each_thread(leader, sibling) {
+			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
+			if (scan++ >= BURST_CACHE_SCAN_LIMIT) break;
+			if (!task_burst_inheritable(sibling)) continue;
+			count++;
+			total += sibling->se.burst_penalty;
+		}
+		update_burst_cache(&leader->se.group_burst_cache, leader, count, total, now);
+	}
 
-	p->se.prev_burst_penalty = max_t(u8, p->se.prev_burst_penalty,
-					 burst_cache);
+	return BORE_BC_PENALTY(READ_ONCE(leader->se.group_burst_cache));
 }
 
 void sched_fork_bore(struct task_struct *p, struct task_struct *parent)
 {
+	u64 now = ktime_get_ns();
+	u16 inherited;
+
 	p->se.burst_time = 0;
 	p->se.curr_burst_penalty = 0;
-	p->se.child_burst_last_cached = 0;
+	p->se.stop_update = false;
+	p->se.futex_waiting = false;
+	p->se.child_burst_cache = 0;
+	p->se.group_burst_cache = 0;
 
-	if (task_burst_inheritable(p))
-		inherit_burst(p, parent);
+	if (!task_burst_inheritable(p))
+		return;
 
-	p->se.burst_penalty = p->se.prev_burst_penalty;
+	read_lock(&tasklist_lock);
+	if (p->signal == parent->signal && p != parent)
+		inherited = inherit_from_thread_group(parent, now);
+	else switch (sched_burst_inherit_type) {
+	case 1:  inherited = inherit_from_direct_children(parent, now); break;
+	case 2:  inherited = inherit_from_ancestor_hub(parent, now); break;
+	default: inherited = 0;
+	}
+	read_unlock(&tasklist_lock);
+
+	p->se.prev_burst_penalty = max_t(u16, p->se.prev_burst_penalty, inherited);
 }
 #endif
 
@@ -10114,9 +10159,8 @@ void __init sched_init(void)
 
 #ifdef CONFIG_SCHED_BORE
 	sched_init_bore();
-	pr_info("BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification 5.3.0 by Masahito Suzuki\n");
+	pr_info("BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification 6.8.0-rc1 (ported) by Masahito Suzuki\n");
 #endif
-
 	wait_bit_init();
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
