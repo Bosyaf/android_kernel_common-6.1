@@ -103,15 +103,14 @@ static const int cap_last_cap = CAP_LAST_CAP;
 
 #ifdef CONFIG_SCHED_BORE
 extern u8 sched_bore;
-extern u8 sched_burst_exclude_kthreads;
-extern u8 sched_burst_smoothness_long;
-extern u8 sched_burst_smoothness_short;
-extern u8 sched_burst_fork_atavistic;
+extern u8 sched_burst_inherit_type;
+extern u8 sched_burst_smoothness;
 extern u8 sched_burst_penalty_offset;
 extern uint sched_burst_penalty_scale;
 extern uint sched_burst_cache_lifetime;
 extern int sched_bore_update_handler(struct ctl_table *table, int write,
-		void __user *buffer, size_t *lenp, loff_t *ppos);
+	void __user *buffer, size_t *lenp, loff_t *ppos);
+static int __maybe_unused two = 2;
 static int __maybe_unused three = 3;
 static int __maybe_unused sixty_four = 64;
 static int __maybe_unused maxval_12_bits = 4095;
@@ -1693,35 +1692,17 @@ static struct ctl_table kern_table[] = {
 		.extra2		= SYSCTL_ONE,
 	},
 	{
-		.procname	= "sched_burst_exclude_kthreads",
-		.data		= &sched_burst_exclude_kthreads,
+		.procname	= "sched_burst_inherit_type",
+		.data		= &sched_burst_inherit_type,
 		.maxlen		= sizeof(u8),
 		.mode		= 0644,
 		.proc_handler	= proc_dou8vec_minmax,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE,
+		.extra2		= &two,
 	},
 	{
-		.procname	= "sched_burst_smoothness_long",
-		.data		= &sched_burst_smoothness_long,
-		.maxlen		= sizeof(u8),
-		.mode		= 0644,
-		.proc_handler	= proc_dou8vec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE,
-	},
-	{
-		.procname	= "sched_burst_smoothness_short",
-		.data		= &sched_burst_smoothness_short,
-		.maxlen		= sizeof(u8),
-		.mode		= 0644,
-		.proc_handler	= proc_dou8vec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE,
-	},
-	{
-		.procname	= "sched_burst_fork_atavistic",
-		.data		= &sched_burst_fork_atavistic,
+		.procname	= "sched_burst_smoothness",
+		.data		= &sched_burst_smoothness,
 		.maxlen		= sizeof(u8),
 		.mode		= 0644,
 		.proc_handler	= proc_dou8vec_minmax,
