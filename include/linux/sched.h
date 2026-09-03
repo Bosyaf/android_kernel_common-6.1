@@ -585,17 +585,26 @@ struct sched_entity {
 #endif
 
 #ifdef CONFIG_SCHED_BORE
+	/* burst_time: raw accumulated runtime since last sleep/yield */
 	ANDROID_KABI_USE(1, u64 burst_time);
+	/* prev/curr_burst_penalty: 16-bit fixed point (8 fractional bits);
+	 * burst_penalty: max(prev,curr), 0 if kthread -- this is the value
+	 * effective_prio_bore() reads. score = burst_penalty >> 8.
+	 * stop_update: guards update_curr_bore() during reweight_task().
+	 * futex_waiting: set/cleared by kernel/futex/waitwake.c so a task
+	 * blocked on a futex does not accrue burst penalty while blocked. */
 	_ANDROID_KABI_REPLACE(_ANDROID_KABI_RESERVE(2),
 		struct {
-			u8 prev_burst_penalty;
-			u8 curr_burst_penalty;
-			u8 burst_penalty;
-			u8 burst_score;
+			u16  prev_burst_penalty;
+			u16  curr_burst_penalty;
+			u16  burst_penalty;
+			bool stop_update;
+			bool futex_waiting;
 		}
 	);
-	ANDROID_KABI_USE2(3, u8 child_burst, u32 child_burst_cnt);
-	ANDROID_KABI_USE(4, u64 child_burst_last_cached);
+	/* packed bore_bc: bits[0:47]=timestamp (ns >> 16), bits[48:63]=penalty */
+	ANDROID_KABI_USE(3, u64 child_burst_cache);
+	ANDROID_KABI_USE(4, u64 group_burst_cache);
 #else
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
